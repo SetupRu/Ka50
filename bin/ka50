@@ -1,0 +1,509 @@
+#!/usr/bin/env perl
+
+use lib::abs '../lib';
+use uni::perl ':dumper';
+use POSIX 'strftime';
+
+use EV;
+use AE;
+use Ka50;
+use Ka50::Draw;
+
+use Getopt::Long qw(:config gnu_getopt);
+use URI::Escape::XS qw(uri_escape uri_unescape);
+use URI;
+use List::Util 'max';
+use Time::HiRes 'time';
+
+sub date () { return strftime '%Y-%d-%m-%H.%M', localtime(); }
+
+
+sub getopt {
+	state $x = 0;
+	#warn "$x... [@ARGV]";
+	@ARGV or $x and return;
+	my %o = (
+		c => undef,     # concurrency
+		n => undef,  # number
+		t => undef, # time limit
+		k => undef, # keep_alive
+		r => undef, # rps,
+		H => [],    # headers
+		T => undef, # TCP connect instead of http
+		form => {fill => [], success => 302},
+	);
+	GetOptions(
+		'-c=n' => \$o{c},
+		'-n=n' => \$o{n},
+		'-t=n' => \$o{t},
+		'-r=s' => \$o{r},
+		'-k'   => \$o{k},
+		'-H=s' => $o{H},
+		'-F'   => \$o{form}{use},
+		'-T'   => \$o{T},
+		'--Ff=s' => $o{form}{fill},
+		'--Fs=n' => $o{form}{success},
+	) or die "Usage";
+
+	my $url = shift @ARGV or die "Usage 2";
+
+	$o{form}{use} = 1 if @{ $o{form}{fill} };
+	$o{form}{use} or delete $o{form};
+	if ($o{r} and $o{c}) {
+		die "-r and -c are mutually exclusive\n";
+	}
+	if ($o{form}) {
+		$o{c} or $o{n} and die "Can't use c or n with form";
+		$o{c} = 1;
+		$o{n} = 1;
+		my $fill = delete $o{form}{fill};
+		for (@$fill) {
+			my ($k,$v) = split '=', $_, 2;
+			$o{form}{fill}{$k} = $v;
+		}
+	} elsif ($o{r}) {
+		$o{n} //= 1000;
+	} else {
+		$o{c} //= 5;
+		$o{n} //= 1000;
+	}
+	for (@{ $o{H} }) {
+		$o{headers}{lc $1} = $2 if /(.+?)(?:\s*=\s*(.+))/;
+	}
+	$o{url} = $url;
+	++$x;
+	return \%o;
+}
+
+sub form_request;
+
+$| = 1;
+our $stop = 0;
+$SIG{INT} = sub {
+	$stop++ and exit;
+	warn "Catched SIGINT. Stopping...";
+};
+our %state;
+sub run {
+	my $o = shift;
+	#warn "process ".dumper $o;
+	if ($o->{form}) {
+		print "Form request to $o->{url}\n";
+		form_request
+			$o->{url},
+			fill => $o->{form}{fill},
+			success => $o->{form}{success},
+			sub {
+				if ( my $ok = shift ) {
+					@state{ keys %$ok } = values %$ok;
+					print "State:\n";
+					for (keys %$ok) {
+						print "\t$_: $ok->{$_}\n";
+					}
+					#warn dumper \%state;
+				} else {
+					warn "@_";
+					exit;
+				}
+				EV::unloop;
+			};
+		EV::loop;
+	} else {
+		my $i = 0;
+		my @c;
+		my $url = URI->new( $o->{url} );
+		my $traffic = 0;
+		my $zero = time;
+		my $filename;
+		my $end;
+		my $cv = AE::cv {
+			my $end = time;
+			print "\n";
+			ref $end and $end->();
+			printf "Processed %d requests in %0.6fs\n", $i, time - $zero;
+			my %stat;
+			for (@c) {
+				$stat{$_->[0]}++;
+			}
+			say "Responses:";
+			for (sort {$a<=>$b} keys %stat) {
+				say "\tStatus $_: $stat{$_}";
+			}
+			printf "Traffic: %0.2fM, %0.2fk/r, %0.2fk/s\n", $traffic/1024/1024, $traffic/1024/$i, $traffic/1024/( time - $zero ) if $i > 0;
+			draw($filename,@c);
+			EV::unloop;
+		};
+		$cv->begin;
+		my $N = $o->{n};
+		if ($o->{T}) {
+			if ($o->{url} =~ /^http(s|):/) {
+				my $port = $1 ? 443 : 80;
+				my $uri = URI->new($o->{url});
+				$o->{url} = $uri->host . ':' . ( $uri->port || $port );
+			}
+			my ($ip,$port) = split /:/,$o->{url};
+			$ip = Socket::inet_ntoa(gethostbyname( $ip ))
+				or die "Can't resolve" unless eval { Socket::inet_aton $ip };
+			$port //= 80;
+			print "Benchmarking $ip:$port (".Socket::inet_ntoa(Socket::inet_aton($ip)).") with TCP connects\n";
+			$filename = date().'-'.$ip.'.'.$port.'.png';
+			if (!$ENV{REALLY}){
+				@c = [200,0.001,0.001];
+				$cv->send;
+				return;
+			}
+			$ip = Socket::inet_aton $ip;
+			my @k;
+			my $c;$c = sub {
+				printf "\r%d connected ...",$i;
+				raw_connect $ip, $port, sub {
+					my $ix = $i++;
+					my $st = time;
+					if (my $fh = shift) {
+						$k[$ix] = $fh; # keep
+						$c[$ix] = [ 200, $st - $zero, time - $st ];
+						return $cv->send if $stop;
+						$c->();
+					} else {
+						print "$ix connect failed: $!\n";
+						$cv->send;
+					}
+				};
+			};$c->();
+		}
+		elsif ($o->{c}) {
+			print "Benchmarking $url with $o->{n} requests, using $o->{c} in parallel\n";
+			$filename = date().'-'.$url->host . '-n'.$o->{n}.'-c'.$o->{c}.'.png';
+			if (!$ENV{REALLY}){
+				@c = [200,0.001,0.001];
+				$cv->send;
+				return;
+			}
+			my $x = con {
+				my $next = shift;
+				return $cv->send if $stop;
+				my $ix = $i++;
+				printf "\r%02.1f%% completed (%d)...",100*$i/$N, $i;
+				my $st = time;
+				$cv->begin;
+				http_request
+					GET => $o->{url},
+					cb => sub {
+						$traffic += length $_[0];
+						$c[$ix] = [ $_[1]{Status}, $st - $zero, time - $st, ];
+						$cv->end;
+						$next->();
+					};
+			} c => $o->{c}, n => $o->{n}, e => sub {
+				$cv->end;
+			};
+		}
+		elsif ($o->{r}) {
+			print "Benchmarking $url with $o->{r} requests per second, using $o->{n} requests\n";
+			$filename = date().'-'.$url->host . '-n'.$o->{n}.'-r'.$o->{r}.'.png';
+			my $maxcon = 0;
+			my $curcon = 0;
+			$end = sub {
+				printf "Max cuncurrent requests: %d\n",$maxcon;
+			};
+			if (!$ENV{REALLY}){
+				@c = [200,0.001,0.001];
+				$cv->send;
+				return;
+			}
+			rps {
+				return $cv->send if $stop;
+				my $ix = $i++;
+				#print "r $ix\n";
+				#printf "\r%02.1f%% completed (%d)...",100*$i/$N, $i;
+				$curcon++;
+				$maxcon = max($maxcon,$curcon);
+				my $st = time;
+				$cv->begin;
+				http_request
+					GET => $o->{url},
+					cb => sub {
+						$traffic += length $_[0];
+						$c[$ix] = [ $_[1]{Status}, $st - $zero, time - $st, ];
+						$cv->end;
+						$curcon--;
+					};
+			} rps => $o->{r}, n => $o->{n}, e => sub {
+				$cv->end;
+			};
+			
+		}
+		else {
+			die "Don't know how to benchmark $url\n";
+		}
+		EV::loop();
+		print "\n";
+	}
+}
+
+while (my $o = getopt()) {
+	run($o)
+}
+
+use Web::Scraper;
+
+sub find_and_fill {
+	my $body = shift;
+	my %fill = %{shift()};
+	utf8::decode $body;
+		my $sc = scraper {
+			process 'form', 'form[]' => scraper {
+				process 'form', action => '@action', method => '@method';
+				process 'input', 'input[]' => scraper {
+					process 'input', type => '@type', name => '@name' , value => '@value';
+				};
+			};
+		};
+		my $forms = $sc->scrape($body)->{form};
+		my $form = $forms->[0];
+		my @fill;
+		if ($form) {
+			for my $i ( @{$form->{input}} ) {
+				if (exists $fill{$i->{name}}) {
+					push @fill, $i->{name}, delete $fill{$i->{name}};
+				}
+				elsif ( $i->{type} =~ /^hidden$/i or ( $i->{type} =~ /submit/ and defined $i->{name} ) or ( $i->{type} =~ /checkbox/ and defined( $i->{value} //= 'on' ) ) ) {
+					push @fill, $i->{name}, $i->{value};
+				}
+				else {
+					#warn "skip ".dumper $i;
+				}
+			}
+		} else {
+			return undef, "No form found";
+		}
+		if (%fill) {
+			return undef, "Left unfilled keys: ".join(', ',keys %fill);
+		}
+		#warn dumper {@fill};
+		my $query = '';
+		while(@fill) {
+			my ($k,$v) = splice @fill,0,2;
+			$query .= uri_escape($k).'='.uri_escape($v).'&';
+		}
+	return {
+		action => $form->{action} || '',
+		query  => $query,
+		ctype  => 'application/x-www-form-urlencoded; charset=utf-8',
+		method => uc( $form->{method} || 'POST' ),
+	};
+}
+
+sub form_request {
+	my $url = shift;
+	my $cb = pop;
+	my %args = @_;
+	my %s;$s{_} = \%s;
+	$s{r1} = http_request GET => $url,
+	sub {
+		my ($b,$h) = @_;
+		my ($form,$error) = find_and_fill($b,delete $args{fill});
+		return $cb->(undef, $error, %s = ()) unless $form;
+		my $uri = URI->new( $h->{URL} );
+		$uri->path( $form->{action} ) if $form->{action};
+		http_request
+			$form->{method} => "$uri",
+			headers => { 'content-type' => $form->{ctype}, },
+			body => $form->{query},
+			sub {
+				my ($b,$h) = @_;
+				if ($h->{Status} == $args{success}) {
+					#warn dumper $h->{'set-cookie'};
+					use HTTP::Easy::Cookies;
+					my $c = HTTP::Easy::Cookies->decode( $h->{'set-cookie'} );
+					#warn dumper $c;
+					my @cookies = map {
+						my @list;
+						for my $k (keys %$_) { push @list, qq{$k=}.uri_escape($_->{$k}{value}); }
+						@list
+					} map { ref() ? ( values %$_ ) : () } values %$c;
+					my $cookie = join '; ',@cookies;
+					$cb->( { cookie => $cookie }, %s = () );
+				} else {
+					return $cb->(undef, "$h->{Status} $h->{Reason}", %s = ());
+				}
+			};
+		#
+	};
+	return;
+}
+
+__END__
+
+if ($o->{form}{use}) {
+	form_request
+		'http://setup.ru/client/auth/login',
+		fill => {
+			email => 'dsimonov@gmail.com',
+			password => 'cherry',
+		},
+		success => 302,
+		sub {
+			warn dumper \@_;
+			my $s = shift
+				or return warn dumper \@_;
+						http_request
+							GET => 'http://xxx.setup.ru',
+							headers => {
+								cookie => $s->{cookie},
+							},
+							sub {
+								if ($_[1]{Status} == 200) {
+									warn "Successfully authenticated";
+								} else {
+									warn dumper $_[1];
+								}
+								EV::unloop;
+							}
+						;
+		}
+	;
+}
+
+
+__END__
+EV::loop;
+
+__END__
+
+
+		my @forms = $body =~ m{ (<form.+?</form>) }xsog;
+		for (@forms) {
+			my $doc = XML::LibXML->new()
+			my $x = xml2hash $_;
+			warn dumper $x;
+=for rem
+			#my (undef,$action) = 
+			m{<form[^>]+action="([^>"]*)">}xso
+			m{<form[^>]+action='([^>"]*)">}xso
+			warn dumper [ m{<form[^>]+action=(['"])([^\1>]*)\1>}xso ];
+			
+			#warn dumper $action;
+=cut
+		}
+
+
+
+=for rem
+my $i = 0;
+my @c;
+my $cv = AE::cv {
+	draw(@c);
+	EV::unloop;
+};
+my $zero = time;
+$cv->begin;
+my $x = detect {
+	my $next = shift;
+	my $ix = $i++;
+	my $st = time;
+	$cv->begin;
+	http_request
+		#GET => 'http://localhost/',
+		GET => 'http://zoo.park.rambler.ru:19999/',
+		cb => sub {
+			$c[$ix] = [ $_[1]{Status}, $st - $zero, time - $st, ];
+			#warn "det: ".$ix.' '.atime. sprintf " %f ", $c[$ix][2];
+			$cv->end;
+			$next->();
+		};
+	return;
+} c => 10, n => 200, e => sub {
+	#warn dumper \%c;
+	warn "detect end";
+	$cv->end;
+};
+
+=cut
+
+
+
+
+#=for rem
+my $i = 0;
+my @c;
+my $cv = AE::cv {
+	draw(@c);
+	EV::unloop;
+};
+my $zero = time;
+$cv->begin;
+my $x = con {
+	#warn "con: ".$i.' '.atime;
+	my $next = shift;
+	my $ix = $i++;
+	my $st = time;
+	$cv->begin;
+#=for rem
+	raw_connect v127.0.0.1, 80, sub {
+		$c[$ix] = [ ( defined($_[0]) ? 200 : 500 ), $st - $zero, time - $st, ];
+		$cv->end;
+		$next->();
+	};
+#=cut
+=for rem
+	http_request
+		#GET => 'http://127.0.0.1/',
+		GET => 'http://localhost/',
+		#GET => 'http://zoo.park.rambler.ru:19999/',
+		cb => sub {
+			$c[$ix] = [ $_[1]{Status}, $st - $zero, time - $st, ];
+			$cv->end;
+			$next->();
+		};
+=cut
+	return;
+} c => 1000, n => 10000, e => sub {
+	#warn dumper \%c;
+	$cv->end;
+};
+
+#=cut
+
+=for rem
+my $cv = AE::cv {
+	#warn dumper \@c;
+	draw(@c);
+	EV::unloop;
+};
+my $zero = time;
+$cv->begin;
+my $x = rps {
+	#warn ++$i.' '.atime;
+	$cv->begin;
+	my $ix = $i++;
+	my $st = time;
+	http_request
+		#GET => 'http://localhost/',
+		GET => 'http://zoo.park.rambler.ru:19999/',
+		cb => sub {
+			$c[$ix] = [ $_[1]{Status}, $st - $zero, time - $st, ];
+			$cv->end;
+		};
+	return;
+} rps => 100, f => 1, e => sub {
+	#warn dumper \%c;
+	$cv->end;
+};
+
+=cut
+
+EV::loop;
+#AE::cv->recv;
+
+__END__
+
+sub wave (&@) {
+	my $code = shift;
+	my %args = @_;
+	
+}
+
+wave {
+	warn ".";
+} fn => 'sin($t)', t => 1;
