@@ -8,7 +8,7 @@ no warnings;
 use Carp;
 
 use base 'Exporter';
-our @EXPORT = our @EXPORT_OK = qw(http_request raw_connect rps con detect);
+our @EXPORT = our @EXPORT_OK = qw(http_request raw_connect form_request rps con detect);
 
 =head1 NAME
 
@@ -41,6 +41,9 @@ use Socket;
 
 use Time::HiRes 'time';
 use Guard 'guard';
+use Web::Scraper; # for form fill
+use URI::Escape::XS qw(uri_escape uri_unescape);
+
 
 sub raw_connect($$$;$) {
 	my ($addr, $port, $connect, $prepare) = @_;
@@ -249,6 +252,96 @@ sub http_request {
 	return;
 }
 
+
+sub find_and_fill {
+	my $body = shift;
+	my %fill = %{shift()};
+	utf8::decode $body;
+		my $sc = scraper {
+			process 'form', 'form[]' => scraper {
+				process 'form', action => '@action', method => '@method';
+				process 'input', 'input[]' => scraper {
+					process 'input', type => '@type', name => '@name' , value => '@value';
+				};
+			};
+		};
+		my $forms = $sc->scrape($body)->{form};
+		my $form = $forms->[0];
+		my @fill;
+		if ($form) {
+			for my $i ( @{$form->{input}} ) {
+				if (exists $fill{$i->{name}}) {
+					push @fill, $i->{name}, delete $fill{$i->{name}};
+				}
+				elsif ( $i->{type} =~ /^hidden$/i or ( $i->{type} =~ /submit/ and defined $i->{name} ) or ( $i->{type} =~ /checkbox/ and defined( $i->{value} //= 'on' ) ) ) {
+					push @fill, $i->{name}, $i->{value};
+				}
+				else {
+					#warn "skip ".dumper $i;
+				}
+			}
+		} else {
+			return undef, "No form found";
+		}
+		if (%fill) {
+			return undef, "Left unfilled keys: ".join(', ',keys %fill);
+		}
+		#warn dumper {@fill};
+		my $query = '';
+		while(@fill) {
+			my ($k,$v) = splice @fill,0,2;
+			$query .= uri_escape($k).'='.uri_escape($v).'&';
+		}
+	return {
+		action => $form->{action} || '',
+		query  => $query,
+		ctype  => 'application/x-www-form-urlencoded; charset=utf-8',
+		method => uc( $form->{method} || 'POST' ),
+	};
+}
+
+sub form_request {
+	my $url = shift;
+	my $cb = pop;
+	my %args = @_;
+	my %s;$s{_} = \%s;
+	$s{r1} = http_request GET => $url, headers => $args{headers} || {},
+	sub {
+		my ($b,$h) = @_;
+		if ($h->{Status} != 200) {
+			return $cb->(undef, "$h->{Status} $h->{Reason}", %s = ());
+		}
+		my ($form,$error) = find_and_fill($b,delete $args{fill});
+		return $cb->(undef, $error, %s = ()) unless $form;
+		my $uri = URI->new( $h->{URL} );
+		$uri->path( $form->{action} ) if $form->{action};
+		http_request
+			$form->{method} => "$uri",
+			headers => { 'content-type' => $form->{ctype}, %{ $args{headers} || {} } },
+			body => $form->{query},
+			sub {
+				my ($b,$h) = @_;
+				if ($h->{Status} == $args{success}) {
+					#warn dumper $h->{'set-cookie'};
+					use HTTP::Easy::Cookies;
+					my $c = HTTP::Easy::Cookies->decode( $h->{'set-cookie'} );
+					#warn dumper $c;
+					my @cookies = map {
+						my @list;
+						for my $k (keys %$_) { push @list, qq{$k=}.uri_escape($_->{$k}{value}); }
+						@list
+					} map { ref() ? ( values %$_ ) : () } values %$c;
+					my $cookie = join '; ',@cookies;
+					$cb->( { cookie => $cookie }, %s = () );
+				} else {
+					return $cb->(undef, "$h->{Status} $h->{Reason}", %s = ());
+				}
+			};
+		#
+	};
+	return;
+}
+
 # Loaders
 
 sub rps (&@) {
@@ -342,13 +435,13 @@ sub con (&@) {
 sub detect(&%) {
 	my $code = shift;
 	my %args = @_;
-	my $cv = AE::cv {
-		$args{e} and $args{e}();
-	};
-	$cv->begin;
 	my $lastrun = 0;
 	my $collected;
 	my $continue = 1;
+	my $cv = AE::cv {
+		$args{e} and $args{e}($lastrun);
+	};
+	$cv->begin;
 	con {
 		my $next = shift;
 		my $start = time;
