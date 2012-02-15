@@ -89,6 +89,9 @@ sub run {
 	#warn "process ".dumper $o;
 	if ($o->{form}) {
 		print "Form request to $o->{url}\n";
+		if (!$o->{form}{fill}) {
+			die "Use fill parameters --Ff='key=value'\n";
+		}
 		form_request
 			$o->{url},
 			fill => $o->{form}{fill},
