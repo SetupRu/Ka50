@@ -193,6 +193,7 @@ sub http_request {
 						}
 						#warn "read $len";
 						if (!defined $headers) {
+							return unless length $rbuf;
 							my($ret, $minor_version, $status, $message, $aheaders) = 
 								HTTP::Parser::XS::parse_http_response($rbuf, HTTP::Parser::XS::HEADERS_AS_ARRAYREF);
 							if ($ret == -1 ){
@@ -201,7 +202,7 @@ sub http_request {
 							}
 							elsif($ret == -2) {
 								#return warn "need more ".dumper $rbuf if length $rbuf < 512;
-								return warn "need more " if length $rbuf < 512;
+								return warn "need more $rbuf" if length $rbuf < 100;
 								return $e->("Garbled response headers");
 							}
 							else {
@@ -344,7 +345,7 @@ sub form_request {
 
 # Loaders
 
-sub rps (&@) {
+sub rps1 (&@) {
 	my $code = shift;
 	my %args = @_;
 	use uni::perl ':dumper';
@@ -377,10 +378,35 @@ sub rps (&@) {
 		#%s = ();
 		return;
 	};
-	warn "created watcher";
 	return defined wantarray ?
 		guard { %s = (); } : undef;
 }
+
+sub rps (&@) {
+	my $code = shift;
+	my %args = @_;
+	my $t = 1/$args{rps};
+	my ($N,$f);
+	if (exists $args{f}) {
+		$f = $args{f};
+		$N = int($f/$t);
+	} else {
+		$N = $args{n} or die "Requred f or n\n";
+		$f = $N/$args{rps};
+	}
+	my %s;$s{s} = \%s;
+	AE::now_update();
+	say "start RPS, n=$N, f=$f, t=$t ".sprintf(" N=%f",$f/$t);
+	$s{t} = AE::timer $t,$t,$code;
+	$s{e} = AE::timer $f, 0, sub {
+		say "Finished after $f";
+		$args{e} and $args{e}();
+		%args = %s = ();
+	};
+	return defined wantarray ?
+		guard { %s = (); } : undef;
+}
+
 
 sub con (&@) {
 	my $code = shift;
@@ -434,36 +460,57 @@ sub con (&@) {
 
 sub detect(&%) {
 	my $code = shift;
-	my %args = @_;
+	my %args = (@_);
+	my $prec = $args{precision} // 0.1;
+	my $must = $args{must} // 0.9;
+	my $reset = $args{reset} // 0.5;
 	my $lastrun = 0;
 	my $collected;
 	my $continue = 1;
+	my $avg;
+	my $sum = 0;
+	 my $collecting; my $hit = 0; my $miss = 0; my $match = 0;
+	my $i = 0; my $offs = $args{n};
 	my $cv = AE::cv {
-		$args{e} and $args{e}($lastrun);
+		$args{e} and $args{e}($lastrun, $avg, $sum, $i);
 	};
 	$cv->begin;
 	con {
 		my $next = shift;
 		my $start = time;
+		
 		$code->(sub {
+			$continue = shift if @_;
 			my $run = time - $start;
+			$i++;
+			return $next->(1) if $i <= $args{n}; # Skip first N requests to give a warm
+			$sum += $run;
+			$avg = $sum/($i - $offs);
 			#warn "det: 1st run: $run";
-			if ($run > $lastrun) {
-				#warn sprintf "time grows (+%f), go ($continue)", $run - $lastrun;
-				$lastrun = $run;
-				$collected = 0;
-				$next->($continue);
-			} else {
-				#warn sprintf "time less (%f), collect", $run - $lastrun;
-				if (++$collected > $args{n}) {
-					$next->($continue = 0);
-				} else {
-					$next->($continue);
-				}
+			printf "\r%d requested avg=%0.6f, last=%0.6f match=%0.2f%% (%d+%d) ...",$i, $avg, $run, $match * 100, $hit,$miss;
+				
+			if( $run > $avg * ( 1 + $reset ) ) { # if some call goes over average over 50%, reset counters
+				#say "$hit/$miss $run / $avg";
+				$hit = $miss = $match = 0;
+				$offs = $i;
+				$sum = 0;
 			}
+			else {
+				if ($run < $avg *( 1+$prec )) {
+					$hit++;
+				}
+				else {
+					$miss++;
+				}
+				$match = ($hit)/($hit+$miss);
+				$continue = 0 if $match > $must and $i - $offs > $args{n};
+			}
+			$next->($continue);
+			$lastrun = $run;
 		});
 	} c => $args{c}, e => sub {
 		#warn "det: end";
+		printf "\n%0.1f%% of last %d requests was less than average %06fs + %0.2d%%\n",$match*100, $args{n}, $avg, $prec*100;
 		$cv->end;
 	};
 	return;
