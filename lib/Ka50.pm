@@ -110,6 +110,7 @@ sub http_request {
 	my %hdr = (
 		Host       => $host,
 		connection => 'close',
+		'user-agent' => 'Ka/50',
 	);
 	$hdr{"content-length"} = length $args{body} if length $args{body} or $method ne "GET";
 	if (my $hdr = $args{headers}) {

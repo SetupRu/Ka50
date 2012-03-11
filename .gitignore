@@ -1,4 +1,4 @@
-
+*.png
 blib*
 inc*
 Makefile
