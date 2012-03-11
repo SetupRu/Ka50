@@ -226,7 +226,7 @@ sub http_request {
 						}
 						#warn "how we get here (@{[ %s ]})?";
 						if (defined $len) {
-							warn "EOF";
+							#warn "EOF";
 							if ($headers) {
 								return $cb->( substr($rbuf,$hlength), $headers, %s = (), "EOF", );
 							} else {
