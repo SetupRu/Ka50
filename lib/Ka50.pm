@@ -183,17 +183,18 @@ sub http_request {
 					my $hlength;
 					my $clength;
 					my $headers;
-					$s{rw} = AE::io $s{fh},0,sub {
+					$s{reader} = sub {
 						local *__ANON__ = '*read.watcher' if DEBUG;
-						#warn "ready to read @{[ %s ]}";
 						$s{fh} and $cb or return %s = ();
+						#warn "ready to read @{[ %s ]}";
 						while ( $s{fh} and ( $len = sysread $s{fh}, $rbuf, 64*1024, $roff ) ) {
 							#warn "read $len";
 							$roff += $len;
 						}
-						#warn "read $len";
-						if (!defined $headers) {
-							return unless length $rbuf;
+						#warn "read ($!) $len <".$rbuf.'> '.$headers;
+						if (!defined $headers and length $rbuf) {
+							#return unless length $rbuf; # BULLSHIT!!!
+							warn $rbuf if DEBUG > 1;
 							my($ret, $minor_version, $status, $message, $aheaders) = 
 								HTTP::Parser::XS::parse_http_response($rbuf, HTTP::Parser::XS::HEADERS_AS_ARRAYREF);
 							if ($ret == -1 ){
@@ -214,8 +215,8 @@ sub http_request {
 						}
 						if (defined $clength) {
 							if (length $rbuf < $hlength + $clength) {
-								warn "buf ".length($rbuf)." lower than required ".($hlength + $clength);#.dumper $rbuf;
-								return $e->("Short read") if $len == 0;
+								#warn "buf ".length($rbuf)." lower than required ".($hlength + $clength)." <$rbuf> ".($len == 0 ? "EOF" : "");#.dumper $rbuf;
+								return $e->("Short read") if defined $len and $len == 0;
 								#return $cb->( substr($rbuf,$hlength), $headers, %s = () );
 							} else {
 								#warn "ok";
@@ -224,8 +225,12 @@ sub http_request {
 						}
 						#warn "how we get here (@{[ %s ]})?";
 						if (defined $len) {
-							#warn "EOF";
-							return $cb->( substr($rbuf,$hlength), $headers, %s = (), "EOF", );
+							warn "EOF";
+							if ($headers) {
+								return $cb->( substr($rbuf,$hlength), $headers, %s = (), "EOF", );
+							} else {
+								return $e->("EOF Before read headers");
+							}
 						}
 						else {
 							if ($! == Errno::EAGAIN or $! == Errno::EINTR or $! == AnyEvent::Util::WSAEWOULDBLOCK) {
@@ -237,6 +242,8 @@ sub http_request {
 						}
 						die "Unreach";
 					};
+					$s{rw} = AE::io $s{fh},0,$s{reader};
+					$s{reader}();
 				} else {
 					if ($! == Errno::ENOTCONN or $! == Errno::EAGAIN or $! == Errno::EINTR or $! == AnyEvent::Util::WSAEWOULDBLOCK) {
 						return;
